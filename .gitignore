@@ -1,0 +1,13 @@
+# Local/runtime artifacts
+.openclaw/
+
+# Temp/debug scripts
+/tmp/
+tmp_*.sh
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Logs (tracked reports are still kept)
+automation/logs/
