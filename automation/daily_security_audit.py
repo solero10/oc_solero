@@ -486,6 +486,116 @@ def analyze_openclaw_security_findings():
     return out
 
 
+def analyze_security_remediations(start_utc: datetime, end_utc: datetime, commands):
+    security_keys = {
+        'gateway.controlUi.dangerouslyAllowHostHeaderOriginFallback',
+        'gateway.controlUi.allowedOrigins',
+        'gateway.auth.rateLimit',
+        'gateway.nodes.denyCommands',
+        'gateway.bind',
+    }
+
+    config_audit_files = [
+        Path('/home/kernk/.openclaw/logs/config-audit.jsonl'),
+        Path('/home/kernk/.openclaw-docker-clone/state/logs/config-audit.jsonl'),
+    ]
+
+    actions = []
+
+    for path in config_audit_files:
+        if not path.exists():
+            continue
+        try:
+            with path.open('r', encoding='utf-8', errors='ignore') as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+
+                    dt = to_dt(obj.get('ts') or obj.get('time'))
+                    if not dt or dt < start_utc or dt > end_utc:
+                        continue
+
+                    argv = obj.get('argv') if isinstance(obj.get('argv'), list) else []
+                    if 'config' not in argv or 'set' not in argv:
+                        continue
+
+                    try:
+                        idx = argv.index('set')
+                    except ValueError:
+                        continue
+
+                    key = argv[idx + 1] if idx + 1 < len(argv) else None
+                    value = argv[idx + 2] if idx + 2 < len(argv) else None
+                    if not isinstance(key, str):
+                        continue
+                    if key not in security_keys:
+                        continue
+
+                    actions.append({
+                        'ts': dt,
+                        'key': key,
+                        'value': value,
+                        'source': str(path),
+                    })
+        except Exception:
+            continue
+
+    actions.sort(key=lambda x: x['ts'])
+
+    def value_is_false(v):
+        return isinstance(v, str) and v.strip().lower() in {'false', '0', 'off', 'no'}
+
+    disabled_fallback = any(
+        a['key'] == 'gateway.controlUi.dangerouslyAllowHostHeaderOriginFallback' and value_is_false(a.get('value'))
+        for a in actions
+    )
+    set_allowed_origins = any(a['key'] == 'gateway.controlUi.allowedOrigins' for a in actions)
+    set_rate_limit = any(a['key'] == 'gateway.auth.rateLimit' for a in actions)
+    updated_deny = any(a['key'] == 'gateway.nodes.denyCommands' for a in actions)
+
+    restart_seen = any(
+        isinstance(cmd, str) and 'openclaw gateway restart' in cmd
+        for cmd in (commands or [])
+    )
+
+    highlights = []
+    if disabled_fallback and set_allowed_origins:
+        highlights.append('Closed the Control UI origin-fallback exposure by disabling fallback and setting explicit allowed origins.')
+    elif disabled_fallback:
+        highlights.append('Disabled the dangerous Control UI origin-fallback setting.')
+    if set_rate_limit:
+        highlights.append('Configured gateway auth rate limiting to reduce brute-force risk.')
+    if updated_deny:
+        highlights.append('Updated deny-command rules for node actions.')
+    if restart_seen:
+        highlights.append('Gateway restart was observed after security-related config changes.')
+
+    if actions:
+        summary = f"Detected {len(actions)} security-related config change(s) in the last 24 hours."
+    else:
+        summary = 'No security-related config changes were detected in the last 24 hours.'
+
+    action_lines = []
+    for a in actions[:8]:
+        value = a.get('value')
+        if isinstance(value, str) and len(value) > 80:
+            value = value[:77] + '...'
+        action_lines.append(f"{a['ts'].isoformat()} | {a['key']} = {value}")
+
+    return {
+        'summary': summary,
+        'actions_count': len(actions),
+        'actions': action_lines,
+        'highlights': highlights,
+        'restart_seen': restart_seen,
+    }
+
+
 tool_counts = Counter()
 role_counts = Counter()
 files_read = set()
@@ -663,6 +773,9 @@ for f in REPORT_DIR.glob('*.md'):
 # security posture from OpenClaw built-in audit
 security_audit_summary = analyze_openclaw_security_findings()
 security_issues_text = '\n'.join([f"- {x}" for x in security_audit_summary.get('issues', [])]) or '- No critical/warning security findings from OpenClaw audit.'
+security_remediation_summary = analyze_security_remediations(START_UTC, NOW_UTC, commands)
+security_remediation_highlights_text = '\n'.join([f"- {x}" for x in security_remediation_summary.get('highlights', [])]) or '- No specific remediation highlights detected in this window.'
+security_remediation_actions_text = '\n'.join([f"- {x}" for x in security_remediation_summary.get('actions', [])]) or '- No security-related config changes detected in this window.'
 
 # human-friendly synthesis
 risk_level = 'low'
@@ -740,6 +853,7 @@ lines.append(f"- I reviewed activity across both OpenClaw environments (host + D
 lines.append(f"- Most activity looked like normal assistant work (reading files, running commands, and responding in chat).")
 lines.append(f"- Protected-file Git summary: {git_summary.get('explanation')}")
 lines.append(f"- Security-audit investigation: {security_audit_summary.get('summary')}")
+lines.append(f"- Security remediation activity: {security_remediation_summary.get('summary')}")
 lines.append(f"- Prompt-injection review: {prompt_summary.get('assessment')}")
 lines.append(f"- Warnings: **{warns_n}** | Errors: **{errors_n}** | Denied/blocked signals: **{denied_n}**")
 lines.append('')
@@ -768,6 +882,14 @@ lines.append('- Investigation notes:')
 lines.append(security_issues_text)
 lines.append('')
 
+lines.append('## Security Remediation Actions (last 24h)')
+lines.append(f"- Summary: {security_remediation_summary.get('summary')}")
+lines.append('- Quick highlights:')
+lines.append(security_remediation_highlights_text)
+lines.append('- Actions detected:')
+lines.append(security_remediation_actions_text)
+lines.append('')
+
 lines.append('## Prompt-Injection Investigation (Balanced)')
 lines.append(f"- Assessment: {prompt_summary.get('assessment')}")
 lines.append(f"- Phrase mentions containing alert text: **{prompt_summary.get('phrase_mentions', 0)}**")
@@ -786,7 +908,7 @@ lines.append(f"3. **Execution context**: Exec contexts seen: {', '.join([f'{k} (
 lines.append(f"4. **Side effects**: Files modified: **{len(files_changed)}**. Major changes listed below.")
 lines.append(f"5. **Network egress**: Unique FQDNs observed: **{len(top_fqdns)}**.")
 lines.append(f"6. **Sensitive access**: Sensitive paths touched: **{len(sensitive_access)}**.")
-lines.append(f"7. **Blocked/denied actions**: Signals detected: **{denied_n}**. OpenClaw security-audit findings: critical **{security_audit_summary.get('critical', 0)}**, warnings **{security_audit_summary.get('warn', 0)}**.")
+lines.append(f"7. **Blocked/denied actions**: Signals detected: **{denied_n}**. OpenClaw security-audit findings: critical **{security_audit_summary.get('critical', 0)}**, warnings **{security_audit_summary.get('warn', 0)}**. Security remediations observed: **{security_remediation_summary.get('actions_count', 0)}** config change(s).")
 lines.append(f"8. **Prompt-injection signals**: {prompt_summary.get('assessment')} (assistant alert replies: **{prompt_summary.get('assistant_alert_responses', 0)}**, suspicious external payloads: **{prompt_summary.get('suspicious_external_payloads', 0)}**, wrappers observed: **{prompt_summary.get('wrapper_events', 0)}**, noise/context phrase mentions: **{prompt_summary.get('non_alert_phrase_mentions', 0)}**).")
 lines.append(f"9. **External actions ledger**: Message actions in logs: {msg_action_text}.")
 lines.append(f"10. **Run integrity**: Runs started: **{run_counts.get('started',0)}** | Runs completed: **{run_counts.get('done',0)}** | Errors: **{errors_n}**.")
