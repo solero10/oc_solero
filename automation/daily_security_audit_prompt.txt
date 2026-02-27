@@ -10,6 +10,9 @@ Execution steps:
 1) Run:
    python3 /home/kernk/.openclaw/workspace/automation/daily_security_audit.py
 2) Parse REPORT_PATH from stdout.
-3) Read REPORT_PATH.
-4) Return the report content as your final response, with one short opener line to Ken.
-5) Include the local markdown file path at the end so it is easy to find later.
+3) Immediately push all workspace changes (including the new report) to GitHub by running:
+   /home/kernk/.openclaw/workspace/automation/git_snapshot.sh report
+4) If step 3 fails, include a short one-line "Git push status" note in your reply.
+5) Read REPORT_PATH.
+6) Return the report content as your final response, with one short opener line to Ken.
+7) Include the local markdown file path at the end so it is easy to find later.
