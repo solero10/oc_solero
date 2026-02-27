@@ -48,21 +48,30 @@ LOG_FILE="$LOG_DIR/git-snapshot.log"
     fi
   done
 
-  # Nothing to commit?
-  if [[ -z "$(git status --porcelain -- "${TRACKED_PATHS[@]}")" ]]; then
+  HAS_CHANGES=0
+  if [[ -n "$(git status --porcelain -- "${TRACKED_PATHS[@]}")" ]]; then
+    HAS_CHANGES=1
+    MSG="snapshot($MODE): $(date +"%Y-%m-%d %H:%M %Z")"
+    git commit -m "$MSG"
+  else
     echo "[$TS_UTC] no tracked changes"
-    exit 0
   fi
 
-  MSG="snapshot($MODE): $(date +"%Y-%m-%d %H:%M %Z")"
-  git commit -m "$MSG"
-
-  # First push may need upstream
   CURRENT_BRANCH="$(git branch --show-current)"
+
+  # Push if needed (also handles previously failed push attempts)
   if ! git rev-parse --abbrev-ref --symbolic-full-name "@{u}" >/dev/null 2>&1; then
     git push -u origin "$CURRENT_BRANCH"
   else
-    git push origin "$CURRENT_BRANCH"
+    AHEAD_COUNT="$(git rev-list --left-right --count @{u}...HEAD | awk '{print $2}')"
+    if [[ "${AHEAD_COUNT:-0}" -gt 0 ]]; then
+      git push origin "$CURRENT_BRANCH"
+    elif [[ "$HAS_CHANGES" -eq 1 ]]; then
+      # Safety push path (should already be covered by ahead check)
+      git push origin "$CURRENT_BRANCH"
+    else
+      echo "[$TS_UTC] nothing pending for push"
+    fi
   fi
 
   echo "[$TS_UTC] snapshot success"
