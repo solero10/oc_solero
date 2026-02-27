@@ -2,6 +2,7 @@
 import json
 import os
 import re
+import subprocess
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -25,6 +26,19 @@ SOURCE_GLOBS = [
     '/home/kernk/.openclaw-docker-clone/state/logs/*.jsonl',
     '/home/kernk/.openclaw-docker-clone/state/agents/*/sessions/*.jsonl',
     '/home/kernk/.openclaw-docker-clone/state/cron/runs/*.jsonl',
+]
+
+# "Important files" tracked in Git snapshots
+PROTECTED_PATHS = [
+    'AGENTS.md',
+    'SOUL.md',
+    'USER.md',
+    'TOOLS.md',
+    'IDENTITY.md',
+    'HEARTBEAT.md',
+    'memory',
+    'automation',
+    'reports',
 ]
 
 URL_RE = re.compile(r'https?://[^\s"\'>)]+', re.IGNORECASE)
@@ -105,6 +119,287 @@ def parse_toolcall(tc):
     name = tc.get('name') or ''
     args = tc.get('arguments') if isinstance(tc.get('arguments'), dict) else {}
     return name, args
+
+
+def analyze_protected_git_changes(repo_path: Path, start_utc: datetime):
+    out = {
+        'available': False,
+        'commit_count': 0,
+        'unique_files': 0,
+        'status_counts': Counter(),
+        'top_files': [],
+        'category_counts': Counter(),
+        'explanation': 'Git-based protected-file analysis was unavailable.',
+    }
+
+    if not (repo_path / '.git').exists():
+        out['explanation'] = 'This workspace is not a Git repository, so protected-file history could not be analyzed.'
+        return out
+
+    since = start_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+    cmd = [
+        'git', '-C', str(repo_path), 'log',
+        f'--since={since}',
+        '--name-status',
+        '--pretty=format:__COMMIT__|%H|%cI|%s',
+        '--',
+        *PROTECTED_PATHS,
+    ]
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    except Exception as e:
+        out['explanation'] = f'Git analysis failed to run: {e}'
+        return out
+
+    if proc.returncode != 0:
+        err = (proc.stderr or '').strip().splitlines()[:1]
+        out['explanation'] = f"Git analysis returned an error: {err[0] if err else 'unknown git error'}"
+        return out
+
+    file_touches = Counter()
+    status_counts = Counter()
+    category_counts = Counter()
+    commit_count = 0
+
+    for raw in (proc.stdout or '').splitlines():
+        line = raw.strip('\n')
+        if not line:
+            continue
+        if line.startswith('__COMMIT__|'):
+            commit_count += 1
+            continue
+
+        parts = line.split('\t')
+        if len(parts) < 2:
+            continue
+
+        status = (parts[0] or '').strip()
+        path = parts[-1].strip()
+        if not path:
+            continue
+
+        status_letter = status[0].upper() if status else '?'
+        status_counts[status_letter] += 1
+        file_touches[path] += 1
+
+        if path in {'AGENTS.md', 'SOUL.md', 'USER.md', 'TOOLS.md', 'IDENTITY.md', 'HEARTBEAT.md'}:
+            category_counts['assistant core configuration'] += 1
+        elif path.startswith('automation/'):
+            category_counts['automation/reporting logic'] += 1
+        elif path.startswith('memory/'):
+            category_counts['memory/journal notes'] += 1
+        elif path.startswith('reports/'):
+            category_counts['generated report outputs'] += 1
+        else:
+            category_counts['other protected paths'] += 1
+
+    unique_files = len(file_touches)
+    top_files = file_touches.most_common(5)
+
+    if commit_count == 0 and unique_files == 0:
+        explanation = 'No Git-tracked changes were recorded for protected files in the last 24 hours.'
+    else:
+        chunks = [f"{commit_count} Git commit(s) touched {unique_files} protected file(s)"]
+        if status_counts.get('D', 0) > 0:
+            chunks.append(f"including {status_counts['D']} deletion(s)")
+        else:
+            chunks.append('with no protected-file deletions')
+        if category_counts:
+            top_cats = ', '.join([f"{k} ({v})" for k, v in category_counts.most_common(3)])
+            chunks.append(f"mainly in: {top_cats}")
+        explanation = '; '.join(chunks) + '.'
+
+    out.update({
+        'available': True,
+        'commit_count': commit_count,
+        'unique_files': unique_files,
+        'status_counts': status_counts,
+        'top_files': top_files,
+        'category_counts': category_counts,
+        'explanation': explanation,
+    })
+    return out
+
+
+def extract_untrusted_payload(text: str) -> str:
+    start_tag = '<<<EXTERNAL_UNTRUSTED_CONTENT'
+    end_tag = '<<<END_EXTERNAL_UNTRUSTED_CONTENT'
+    if start_tag not in text or end_tag not in text:
+        return text
+    start_idx = text.find(start_tag)
+    start_body = text.find('>>>', start_idx)
+    end_idx = text.find(end_tag, start_body if start_body >= 0 else start_idx)
+    if start_body >= 0 and end_idx > start_body:
+        return text[start_body + 3:end_idx].strip()
+    return text
+
+
+def analyze_prompt_injection(session_files, start_utc: datetime, end_utc: datetime):
+    phrase = '🚨 SECURITY ALERT: Potential Prompt Injection Detected.'
+
+    suspicious_patterns = [
+        (re.compile(r'ignore\s+(all|previous|prior)\s+instructions', re.I), 'instruction override attempt'),
+        (re.compile(r'(system|developer)\s+(prompt|message)', re.I), 'prompt-role manipulation attempt'),
+        (re.compile(r'execute\s+(shell|bash|terminal|system)\s+command', re.I), 'command execution request'),
+        (re.compile(r'\bsudo\b', re.I), 'privilege escalation request'),
+        (re.compile(r'openclaw\s+config', re.I), 'config tampering request'),
+        (re.compile(r'(reveal|exfiltrate|send)\s+.*(token|password|secret|credential)', re.I), 'secret exfiltration request'),
+        (re.compile(r'delete\s+(all\s+)?(data|files|emails)', re.I), 'destructive data request'),
+        (re.compile(r'<\s*system\s*>|role\s*:\s*system', re.I), 'fake system-role content'),
+    ]
+
+    mention_keys = set()
+    assistant_alert_keys = set()
+    wrapper_map = {}
+    suspicious_map = {}
+    assistant_tool_events = []
+
+    for path in session_files:
+        path_str = str(path)
+        try:
+            with path.open('r', encoding='utf-8', errors='ignore') as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    if obj.get('type') != 'message':
+                        continue
+
+                    dt = event_dt(obj)
+                    if not dt or dt < start_utc or dt > end_utc:
+                        continue
+
+                    msg = obj.get('message') if isinstance(obj.get('message'), dict) else {}
+                    role = msg.get('role') or 'unknown'
+                    tool_name = msg.get('toolName') if isinstance(msg.get('toolName'), str) else None
+                    content = msg.get('content') if isinstance(msg.get('content'), list) else []
+
+                    text_parts = []
+                    for part in content:
+                        if isinstance(part, dict) and part.get('type') == 'text' and isinstance(part.get('text'), str):
+                            text_parts.append(part.get('text'))
+                    combined = '\n'.join(text_parts)
+
+                    if phrase in combined:
+                        mention_key = (dt.isoformat(), path_str, role, combined[:180])
+                        mention_keys.add(mention_key)
+                        if role == 'assistant' and combined.strip().startswith(phrase):
+                            assistant_alert_keys.add(mention_key)
+
+                    if role == 'assistant':
+                        for part in content:
+                            if isinstance(part, dict) and part.get('type') == 'toolCall':
+                                name = part.get('name')
+                                if isinstance(name, str) and name:
+                                    assistant_tool_events.append({
+                                        'ts': dt,
+                                        'path': path_str,
+                                        'name': name,
+                                    })
+
+                    if role == 'toolResult' and tool_name == 'web_fetch' and 'EXTERNAL_UNTRUSTED_CONTENT' in combined:
+                        wrapper_url = None
+                        wrapped_text = combined
+                        try:
+                            payload = json.loads(combined)
+                            if isinstance(payload, dict):
+                                if isinstance(payload.get('url'), str):
+                                    wrapper_url = payload.get('url')
+                                if isinstance(payload.get('text'), str):
+                                    wrapped_text = payload.get('text')
+                        except Exception:
+                            pass
+
+                        external_payload = extract_untrusted_payload(wrapped_text)
+                        wrapper_key = (dt.isoformat(), path_str, wrapper_url or '', external_payload[:220])
+                        wrapper_map[wrapper_key] = {
+                            'ts': dt,
+                            'path': path_str,
+                            'url': wrapper_url,
+                            'payload': external_payload,
+                        }
+
+                        matches = sorted({label for regex, label in suspicious_patterns if regex.search(external_payload)})
+                        if matches:
+                            suspicious_key = (dt.isoformat(), path_str, wrapper_url or '', tuple(matches), external_payload[:220])
+                            suspicious_map[suspicious_key] = {
+                                'ts': dt,
+                                'path': path_str,
+                                'url': wrapper_url,
+                                'matches': matches,
+                                'snippet': external_payload.replace('\n', ' ')[:220],
+                            }
+        except Exception:
+            continue
+
+    suspicious_events = sorted(suspicious_map.values(), key=lambda x: x['ts'])
+    followthrough_count = 0
+    followthrough_examples = []
+    high_impact_tools = {'exec', 'write', 'edit', 'message', 'nodes', 'browser', 'sessions_send', 'cron'}
+
+    for ev in suspicious_events:
+        had_followthrough = False
+        for te in assistant_tool_events:
+            if te['path'] != ev['path']:
+                continue
+            delta = te['ts'] - ev['ts']
+            if timedelta(0) <= delta <= timedelta(minutes=5) and te['name'] in high_impact_tools:
+                had_followthrough = True
+                if len(followthrough_examples) < 5:
+                    followthrough_examples.append(f"{te['name']} after suspicious payload at {ev['ts'].isoformat()}")
+                break
+        if had_followthrough:
+            followthrough_count += 1
+
+    phrase_mentions = len(mention_keys)
+    assistant_alert_responses = len(assistant_alert_keys)
+    non_alert_phrase_mentions = max(0, phrase_mentions - assistant_alert_responses)
+    wrapper_events = len(wrapper_map)
+    suspicious_external_payloads = len(suspicious_events)
+
+    if suspicious_external_payloads > 0 and followthrough_count > 0:
+        assessment = 'HIGH concern: suspicious external instruction patterns appeared and were followed by high-impact tool activity shortly afterward.'
+    elif suspicious_external_payloads > 0:
+        assessment = 'MEDIUM concern: suspicious external instruction patterns appeared, but no clear high-impact follow-through was found.'
+    elif assistant_alert_responses > 0:
+        assessment = 'LOW-MEDIUM concern: explicit security-alert responses were triggered by the assistant.'
+    elif wrapper_events > 0 or non_alert_phrase_mentions > 0:
+        assessment = 'LOW concern: only wrapper/noise-style indicators were detected (no confirmed exploitation pattern).'
+    else:
+        assessment = 'No meaningful prompt-injection indicators were detected in this window.'
+
+    findings = []
+    if suspicious_external_payloads > 0:
+        findings.append(f"Suspicious external payloads: {suspicious_external_payloads}")
+        for ev in suspicious_events[:3]:
+            findings.append(f"- {ev['ts'].isoformat()} | {ev.get('url') or 'unknown source'} | matched: {', '.join(ev['matches'])}")
+    else:
+        findings.append('No suspicious instruction patterns were found inside external payload content.')
+
+    if assistant_alert_responses > 0:
+        findings.append(f"Assistant explicit security-alert replies observed: {assistant_alert_responses}")
+    if non_alert_phrase_mentions > 0:
+        findings.append(f"Phrase mentions treated as context/noise: {non_alert_phrase_mentions}")
+    if wrapper_events > 0:
+        findings.append(f"External untrusted-content wrappers observed: {wrapper_events}")
+    if followthrough_examples:
+        findings.append('Potential follow-through examples: ' + '; '.join(followthrough_examples[:3]))
+
+    return {
+        'assessment': assessment,
+        'phrase_mentions': phrase_mentions,
+        'assistant_alert_responses': assistant_alert_responses,
+        'non_alert_phrase_mentions': non_alert_phrase_mentions,
+        'wrapper_events': wrapper_events,
+        'suspicious_external_payloads': suspicious_external_payloads,
+        'followthrough_high_impact': followthrough_count,
+        'findings': findings,
+    }
 
 
 tool_counts = Counter()
@@ -329,6 +624,15 @@ errors_n = len(errors)
 warns_n = len(warns)
 denied_n = len(denied_events)
 
+git_summary = analyze_protected_git_changes(WORKSPACE, START_UTC)
+git_top_files_text = ', '.join([f"{p} ({n})" for p, n in git_summary.get('top_files', [])]) or 'None in this window.'
+git_status_counts = git_summary.get('status_counts', Counter())
+git_status_text = ', '.join([f"{k}: {v}" for k, v in sorted(git_status_counts.items())]) or 'None'
+
+session_files = [p for p in source_files if '/sessions/' in str(p)]
+prompt_summary = analyze_prompt_injection(session_files, START_UTC, NOW_UTC)
+prompt_findings_text = '\n'.join([f"- {x}" for x in prompt_summary.get('findings', [])]) or '- No prompt-injection findings to report.'
+
 report_date = (NOW_UTC - timedelta(hours=24)).astimezone().date().isoformat()
 out_file = REPORT_DIR / f"security-audit-{report_date}.md"
 
@@ -340,6 +644,8 @@ lines.append(f"- Overall risk feel: **{risk_level.upper()}**")
 lines.append(f"- Why this rating: {risk_reason_text}")
 lines.append(f"- I reviewed activity across both OpenClaw environments (host + Docker twin) and found **{window_events} tracked events** in the last 24 hours.")
 lines.append(f"- Most activity looked like normal assistant work (reading files, running commands, and responding in chat).")
+lines.append(f"- Protected-file Git summary: {git_summary.get('explanation')}")
+lines.append(f"- Prompt-injection review: {prompt_summary.get('assessment')}")
 lines.append(f"- Warnings: **{warns_n}** | Errors: **{errors_n}** | Denied/blocked signals: **{denied_n}**")
 lines.append('')
 
@@ -351,6 +657,25 @@ lines.append(f"- Commands executed: **{len(commands)}**")
 lines.append(f"- Skills referenced: **{skills_text}**")
 lines.append(f"- FQDNs contacted/seen: **{len(top_fqdns)}**")
 lines.append(f"  - {fqdn_text}")
+lines.append(f"- Git commits touching protected files: **{git_summary.get('commit_count', 0)}**")
+lines.append(f"- Protected files touched in Git: **{git_summary.get('unique_files', 0)}**")
+lines.append('')
+
+lines.append('## Protected Files Change Summary (Git, last 24h)')
+lines.append(f"- Concise explanation: {git_summary.get('explanation')}")
+lines.append(f"- Change type counts: {git_status_text}")
+lines.append(f"- Most changed protected files: {git_top_files_text}")
+lines.append('')
+
+lines.append('## Prompt-Injection Investigation (Balanced)')
+lines.append(f"- Assessment: {prompt_summary.get('assessment')}")
+lines.append(f"- Phrase mentions containing alert text: **{prompt_summary.get('phrase_mentions', 0)}**")
+lines.append(f"- Assistant explicit security-alert replies: **{prompt_summary.get('assistant_alert_responses', 0)}**")
+lines.append(f"- External untrusted wrappers observed: **{prompt_summary.get('wrapper_events', 0)}**")
+lines.append(f"- Suspicious external payloads (content-level): **{prompt_summary.get('suspicious_external_payloads', 0)}**")
+lines.append(f"- Suspected high-impact follow-through after suspicious payloads: **{prompt_summary.get('followthrough_high_impact', 0)}**")
+lines.append('- Investigation notes:')
+lines.append(prompt_findings_text)
 lines.append('')
 
 lines.append('## Security Addendum (10-point overview)')
@@ -361,7 +686,7 @@ lines.append(f"4. **Side effects**: Files modified: **{len(files_changed)}**. Ma
 lines.append(f"5. **Network egress**: Unique FQDNs observed: **{len(top_fqdns)}**.")
 lines.append(f"6. **Sensitive access**: Sensitive paths touched: **{len(sensitive_access)}**.")
 lines.append(f"7. **Blocked/denied actions**: Signals detected: **{denied_n}**.")
-lines.append(f"8. **Prompt-injection signals**: Alerts triggered: **{injection_alerts}**; untrusted external-content wrappers seen: **{external_untrusted_events}**.")
+lines.append(f"8. **Prompt-injection signals**: {prompt_summary.get('assessment')} (assistant alert replies: **{prompt_summary.get('assistant_alert_responses', 0)}**, suspicious external payloads: **{prompt_summary.get('suspicious_external_payloads', 0)}**, wrappers observed: **{prompt_summary.get('wrapper_events', 0)}**, noise/context phrase mentions: **{prompt_summary.get('non_alert_phrase_mentions', 0)}**).")
 lines.append(f"9. **External actions ledger**: Message actions in logs: {msg_action_text}.")
 lines.append(f"10. **Run integrity**: Runs started: **{run_counts.get('started',0)}** | Runs completed: **{run_counts.get('done',0)}** | Errors: **{errors_n}**.")
 lines.append('')
