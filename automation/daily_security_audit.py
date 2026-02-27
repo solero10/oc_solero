@@ -402,6 +402,90 @@ def analyze_prompt_injection(session_files, start_utc: datetime, end_utc: dateti
     }
 
 
+def summarize_security_finding(finding: dict) -> str:
+    check_id = (finding.get('checkId') or '').strip()
+    title = (finding.get('title') or 'Security finding').strip()
+    detail = (finding.get('detail') or '').strip()
+    remediation = (finding.get('remediation') or '').strip()
+
+    if check_id == 'gateway.control_ui.host_header_origin_fallback':
+        why = 'Control UI origin protections are weakened, which can increase browser-based attack risk.'
+    elif check_id == 'gateway.auth_no_rate_limit':
+        why = 'Without rate limiting, repeated login attempts are easier to brute-force.'
+    elif check_id == 'gateway.nodes.deny_commands_ineffective':
+        why = 'Some deny rules may not actually block what they were intended to block.'
+    elif check_id == 'config.insecure_or_dangerous_flags':
+        why = 'At least one explicitly dangerous config flag is enabled.'
+    else:
+        why = detail.split('\n')[0] if detail else 'Potential security impact requires review.'
+
+    fix = remediation.split('\n')[0] if remediation else 'Review and apply recommended hardening.'
+    return f"{title} — Why it matters: {why} Fix: {fix}"
+
+
+def analyze_openclaw_security_findings():
+    out = {
+        'available': False,
+        'critical': 0,
+        'warn': 0,
+        'info': 0,
+        'issues': [],
+        'summary': 'OpenClaw security audit was unavailable in this run.',
+    }
+
+    cmd = ['openclaw', 'security', 'audit', '--json']
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=90)
+    except Exception as e:
+        out['summary'] = f'OpenClaw security audit could not run: {e}'
+        return out
+
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or '').strip().splitlines()
+        out['summary'] = f"OpenClaw security audit failed: {err[0] if err else 'unknown error'}"
+        return out
+
+    try:
+        data = json.loads((proc.stdout or '').strip())
+    except Exception:
+        out['summary'] = 'OpenClaw security audit output could not be parsed as JSON.'
+        return out
+
+    findings = data.get('findings') if isinstance(data.get('findings'), list) else []
+    critical = 0
+    warn = 0
+    info = 0
+    issues = []
+
+    for f in findings:
+        if not isinstance(f, dict):
+            continue
+        sev = (f.get('severity') or '').lower()
+        if sev == 'critical':
+            critical += 1
+            issues.append('[CRITICAL] ' + summarize_security_finding(f))
+        elif sev == 'warn':
+            warn += 1
+            issues.append('[WARNING] ' + summarize_security_finding(f))
+        elif sev == 'info':
+            info += 1
+
+    if critical == 0 and warn == 0:
+        summary = 'No critical or warning findings were reported by OpenClaw security audit in this window.'
+    else:
+        summary = f"OpenClaw security audit found {critical} critical and {warn} warning issue(s) requiring attention."
+
+    out.update({
+        'available': True,
+        'critical': critical,
+        'warn': warn,
+        'info': info,
+        'issues': issues,
+        'summary': summary,
+    })
+    return out
+
+
 tool_counts = Counter()
 role_counts = Counter()
 files_read = set()
@@ -576,10 +660,21 @@ for f in REPORT_DIR.glob('*.md'):
     except Exception:
         pass
 
+# security posture from OpenClaw built-in audit
+security_audit_summary = analyze_openclaw_security_findings()
+security_issues_text = '\n'.join([f"- {x}" for x in security_audit_summary.get('issues', [])]) or '- No critical/warning security findings from OpenClaw audit.'
+
 # human-friendly synthesis
 risk_level = 'low'
 risk_reasons = []
 
+critical_findings = int(security_audit_summary.get('critical', 0) or 0)
+warning_findings = int(security_audit_summary.get('warn', 0) or 0)
+
+if critical_findings > 0:
+    risk_reasons.append(f"OpenClaw security audit reported critical findings ({critical_findings})")
+if warning_findings > 0:
+    risk_reasons.append(f"OpenClaw security audit reported warning findings ({warning_findings})")
 if high_risk_actions >= 8:
     risk_reasons.append(f"many higher-impact actions were observed ({high_risk_actions})")
 if len(files_changed) >= 5:
@@ -587,7 +682,7 @@ if len(files_changed) >= 5:
 if len(errors) >= 5:
     risk_reasons.append(f"there were repeated error events ({len(errors)})")
 
-if high_risk_actions >= 8 or len(files_changed) >= 5 or len(errors) >= 5:
+if critical_findings > 0 or high_risk_actions >= 8 or len(files_changed) >= 5 or len(errors) >= 5:
     risk_level = 'high'
 else:
     if high_risk_actions >= 3:
@@ -596,7 +691,7 @@ else:
         risk_reasons.append(f"files were modified ({len(files_changed)})")
     if len(errors) >= 1:
         risk_reasons.append(f"there were error events ({len(errors)})")
-    if high_risk_actions >= 3 or len(files_changed) >= 1 or len(errors) >= 1:
+    if warning_findings > 0 or high_risk_actions >= 3 or len(files_changed) >= 1 or len(errors) >= 1:
         risk_level = 'medium'
 
 if risk_level == 'low':
@@ -645,6 +740,7 @@ lines.append(f"- Why this rating: {risk_reason_text}")
 lines.append(f"- I reviewed activity across both OpenClaw environments (host + Docker twin) and found **{window_events} tracked events** in the last 24 hours.")
 lines.append(f"- Most activity looked like normal assistant work (reading files, running commands, and responding in chat).")
 lines.append(f"- Protected-file Git summary: {git_summary.get('explanation')}")
+lines.append(f"- Security-audit investigation: {security_audit_summary.get('summary')}")
 lines.append(f"- Prompt-injection review: {prompt_summary.get('assessment')}")
 lines.append(f"- Warnings: **{warns_n}** | Errors: **{errors_n}** | Denied/blocked signals: **{denied_n}**")
 lines.append('')
@@ -667,6 +763,13 @@ lines.append(f"- Change type counts: {git_status_text}")
 lines.append(f"- Most changed protected files: {git_top_files_text}")
 lines.append('')
 
+lines.append('## Security Findings Investigation (Balanced)')
+lines.append(f"- Assessment: {security_audit_summary.get('summary')}")
+lines.append(f"- Critical findings: **{security_audit_summary.get('critical', 0)}** | Warning findings: **{security_audit_summary.get('warn', 0)}**")
+lines.append('- Investigation notes:')
+lines.append(security_issues_text)
+lines.append('')
+
 lines.append('## Prompt-Injection Investigation (Balanced)')
 lines.append(f"- Assessment: {prompt_summary.get('assessment')}")
 lines.append(f"- Phrase mentions containing alert text: **{prompt_summary.get('phrase_mentions', 0)}**")
@@ -685,7 +788,7 @@ lines.append(f"3. **Execution context**: Exec contexts seen: {', '.join([f'{k} (
 lines.append(f"4. **Side effects**: Files modified: **{len(files_changed)}**. Major changes listed below.")
 lines.append(f"5. **Network egress**: Unique FQDNs observed: **{len(top_fqdns)}**.")
 lines.append(f"6. **Sensitive access**: Sensitive paths touched: **{len(sensitive_access)}**.")
-lines.append(f"7. **Blocked/denied actions**: Signals detected: **{denied_n}**.")
+lines.append(f"7. **Blocked/denied actions**: Signals detected: **{denied_n}**. OpenClaw security-audit findings: critical **{security_audit_summary.get('critical', 0)}**, warnings **{security_audit_summary.get('warn', 0)}**.")
 lines.append(f"8. **Prompt-injection signals**: {prompt_summary.get('assessment')} (assistant alert replies: **{prompt_summary.get('assistant_alert_responses', 0)}**, suspicious external payloads: **{prompt_summary.get('suspicious_external_payloads', 0)}**, wrappers observed: **{prompt_summary.get('wrapper_events', 0)}**, noise/context phrase mentions: **{prompt_summary.get('non_alert_phrase_mentions', 0)}**).")
 lines.append(f"9. **External actions ledger**: Message actions in logs: {msg_action_text}.")
 lines.append(f"10. **Run integrity**: Runs started: **{run_counts.get('started',0)}** | Runs completed: **{run_counts.get('done',0)}** | Errors: **{errors_n}**.")
