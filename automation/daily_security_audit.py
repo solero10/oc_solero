@@ -709,7 +709,6 @@ top_fqdns = sorted(fqdns)
 fqdn_text = ', '.join(top_fqdns[:20]) if top_fqdns else 'None detected.'
 
 changed_text = '\n'.join([f"- {p}" for p in sorted(files_changed)[:30]]) or '- None'
-read_text = '\n'.join([f"- {p}" for p in sorted(files_read)[:30]]) or '- None'
 skills_text = ', '.join(sorted(skills_used)) if skills_used else 'None detected.'
 
 msg_action_counts = Counter((x.get('action') or 'unknown') for x in external_actions)
@@ -747,7 +746,6 @@ lines.append('')
 
 lines.append('## Work Log Overview (all activity, previous 24 hours)')
 lines.append(f"- Tool activity (top): {most_used_tools}")
-lines.append(f"- Files read (unique): **{len(files_read)}**")
 lines.append(f"- Files changed (unique): **{len(files_changed)}**")
 lines.append(f"- Commands executed: **{len(commands)}**")
 lines.append(f"- Skills referenced: **{skills_text}**")
@@ -797,9 +795,6 @@ lines.append('')
 lines.append('## File Activity Details')
 lines.append('### Files changed')
 lines.append(changed_text)
-lines.append('')
-lines.append('### Files read')
-lines.append(read_text)
 lines.append('')
 
 lines.append('## Notes')
