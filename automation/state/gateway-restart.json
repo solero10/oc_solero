@@ -1,0 +1,14 @@
+{
+  "start_epoch": 1772676551,
+  "start_text": "Wed 2026-03-04 18:09:11 PST",
+  "pid": 12225,
+  "source": "systemd",
+  "last_session": {
+    "key": "agent:main:telegram:direct:7729039890",
+    "agentId": "main",
+    "kind": "direct",
+    "updatedAt": 1772676909214,
+    "age": 259025
+  },
+  "checked_at": 1772694905
+}
